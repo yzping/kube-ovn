@@ -41,7 +41,7 @@ If you want to try the latest developing Kube-OVN, try the script below
  JOIN_CIDR="100.64.0.0/16"              # Do NOT overlap with NODE/POD/SVC CIDR
  LABEL="node-role.kubernetes.io/master" # The node label to deploy OVN DB
  IFACE=""                               # The nic to support container network can be a nic name or a group of regex separated by comma, if empty will use the nic that the default route use
- VERSION="v1.7.0"
+ VERSION="v1.7.1"
 ```
 
 After v1.6.0 `IFACE` support regex, e.g. `IFACE=enp6s0f0,eth.*`
@@ -133,7 +133,7 @@ You can use `--default-cidr` flags below to config default Pod CIDR or create a 
 ```bash
       --add_dir_header                    If true, adds the file directory to the header
       --alsologtostderr                   log to standard error as well as files
-      --bind-socket string                The socket daemon bind to. (default "/var/run/cniserver.sock")
+      --bind-socket string                The socket daemon bind to. (default "/run/openvswitch/kube-ovn-daemon.sock")
       --default-interface-name string     The default host interface name in the vlan/vxlan type
       --default-provider-name string      The vlan or vxlan type default provider interface name, default: provider (default "provider")
       --enable-mirror                     Enable traffic mirror, default: false

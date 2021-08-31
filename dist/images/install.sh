@@ -6,6 +6,7 @@ DualStack=${DualStack:-false}
 ENABLE_SSL=${ENABLE_SSL:-false}
 ENABLE_VLAN=${ENABLE_VLAN:-false}
 ENABLE_MIRROR=${ENABLE_MIRROR:-false}
+VLAN_NIC=${VLAN_NIC:-}
 HW_OFFLOAD=${HW_OFFLOAD:-false}
 IFACE=""                               # The nic to support container network can be a nic name or a group of regex separated by comma, if empty will use the nic that the default route use
 
@@ -13,7 +14,7 @@ CNI_CONF_DIR="/etc/cni/net.d"
 CNI_BIN_DIR="/opt/cni/bin"
 
 REGISTRY="kubeovn"
-VERSION="v1.7.0"
+VERSION="v1.7.1"
 IMAGE_PULL_POLICY="IfNotPresent"
 POD_CIDR="10.16.0.0/16"                # Do NOT overlap with NODE/SVC/JOIN CIDR
 POD_GATEWAY="10.16.0.1"
@@ -49,7 +50,6 @@ PROVIDER_NAME="provider"
 VLAN_INTERFACE_NAME=""
 VLAN_NAME="ovn-vlan"
 VLAN_ID="100"
-VLAN_RANGE="1,4095"
 
 if [ "$ENABLE_VLAN" = "true" ]; then
   NETWORK_TYPE="vlan"
@@ -548,7 +548,6 @@ spec:
     kind: Subnet
     shortNames:
       - subnet
-
 ---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
@@ -567,24 +566,34 @@ spec:
             spec:
               type: object
               properties:
+                id:
+                  type: integer
+                  minimum: 0
+                  maximum: 4095
+                provider:
+                  type: string
                 vlanId:
                   type: integer
+                  description: Deprecated in favor of id
                 providerInterfaceName:
                   type: string
-                logicalInterfaceName:
-                  type: string
-                subnet:
-                  type: string
+                  description: Deprecated in favor of provider
+              required:
+                - provider
+            status:
+              type: object
+              properties:
+                subnets:
+                  type: array
+                  items:
+                    type: string
       additionalPrinterColumns:
-      - name: VlanID
+      - name: ID
         type: string
-        jsonPath: .spec.vlanId
-      - name: ProviderInterfaceName
+        jsonPath: .spec.id
+      - name: Provider
         type: string
-        jsonPath: .spec.providerInterfaceName
-      - name: Subnet
-        type: string
-        jsonPath: .spec.subnet
+        jsonPath: .spec.provider
   scope: Cluster
   names:
     plural: vlans
@@ -592,6 +601,88 @@ spec:
     kind: Vlan
     shortNames:
       - vlan
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: provider-networks.kubeovn.io
+spec:
+  group: kubeovn.io
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                defaultInterface:
+                  type: string
+                customInterfaces:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      interface:
+                        type: string
+                      nodes:
+                        type: array
+                        items:
+                          type: string
+                excludeNodes:
+                  type: array
+                  items:
+                    type: string
+              required:
+                - defaultInterface
+            status:
+              type: object
+              properties:
+                ready:
+                  type: boolean
+                readyNodes:
+                  type: array
+                  items:
+                    type: string
+                vlans:
+                  type: array
+                  items:
+                    type: string
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      node:
+                        type: string
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      lastUpdateTime:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+      additionalPrinterColumns:
+      - name: DefaultInterface
+        type: string
+        jsonPath: .spec.defaultInterface
+      - name: Ready
+        type: boolean
+        jsonPath: .status.ready
+  scope: Cluster
+  names:
+    plural: provider-networks
+    singular: provider-network
+    kind: ProviderNetwork
+    listKind: ProviderNetworkList
 EOF
 
 if $DPDK; then
@@ -631,6 +722,8 @@ kind: ConfigMap
 metadata:
   name: ovn-config
   namespace: kube-system
+data:
+  defaultNetworkType: '$NETWORK_TYPE'
 
 ---
 apiVersion: v1
@@ -659,12 +752,15 @@ rules:
       - subnets/status
       - ips
       - vlans
+      - provider-networks
+      - provider-networks/status
     verbs:
       - "*"
   - apiGroups:
       - ""
     resources:
       - pods
+      - pods/exec
       - namespaces
       - nodes
       - configmaps
@@ -980,6 +1076,8 @@ spec:
             - mountPath: /sys
               name: host-sys
               readOnly: true
+            - mountPath: /etc/cni/net.d
+              name: cni-conf
             - mountPath: /etc/openvswitch
               name: host-config-openvswitch
             - mountPath: /etc/ovn
@@ -1035,6 +1133,9 @@ spec:
         - name: host-sys
           hostPath:
             path: /sys
+        - name: cni-conf
+          hostPath:
+            path: /etc/cni/net.d
         - name: host-config-openvswitch
           hostPath:
             path: /etc/origin/openvswitch
@@ -1100,6 +1201,8 @@ kind: ConfigMap
 metadata:
   name: ovn-config
   namespace: kube-system
+data:
+  defaultNetworkType: '$NETWORK_TYPE'
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -1129,6 +1232,8 @@ rules:
       - subnets/status
       - ips
       - vlans
+      - provider-networks
+      - provider-networks/status
       - networks
     verbs:
       - "*"
@@ -1136,6 +1241,7 @@ rules:
       - ""
     resources:
       - pods
+      - pods/exec
       - namespaces
       - nodes
       - configmaps
@@ -1446,6 +1552,8 @@ spec:
             - mountPath: /sys
               name: host-sys
               readOnly: true
+            - mountPath: /etc/cni/net.d
+              name: cni-conf
             - mountPath: /etc/openvswitch
               name: host-config-openvswitch
             - mountPath: /etc/ovn
@@ -1497,6 +1605,9 @@ spec:
         - name: host-sys
           hostPath:
             path: /sys
+        - name: cni-conf
+          hostPath:
+            path: /etc/cni/net.d
         - name: host-config-openvswitch
           hostPath:
             path: /etc/origin/openvswitch
@@ -1683,7 +1794,7 @@ spec:
           - /kube-ovn/start-cniserver.sh
         args:
           - --enable-mirror=$ENABLE_MIRROR
-          - --encap-checksum=false
+          - --encap-checksum=true
           - --service-cluster-ip-range=$SVC_CIDR
           - --iface=${IFACE}
           - --network-type=$NETWORK_TYPE
@@ -2102,6 +2213,7 @@ OVN_SB_POD=
 showHelp(){
   echo "kubectl ko {subcommand} [option...]"
   echo "Available Subcommands:"
+  echo "  [nb|sb] [status|kick|backup]     ovn-db operations show cluster status, kick stale server or backup database"
   echo "  nbctl [ovn-nbctl options ...]    invoke ovn-nbctl"
   echo "  sbctl [ovn-sbctl options ...]    invoke ovn-sbctl"
   echo "  vsctl {nodeName} [ovs-vsctl options ...]   invoke ovs-vsctl on selected node"
@@ -2144,8 +2256,15 @@ tcpdump(){
       echo "nic doesn't exist on node $nodeName"
       exit 1
     fi
+
+    podNicType=$(kubectl get pod "$podName" -n "$namespace" -o jsonpath={.metadata.annotations.ovn\\.kubernetes\\.io/pod_nic_type})
+    podNetNs=$(kubectl exec "$ovnCni" -n $KUBE_OVN_NS -- ovs-vsctl --data=bare --no-heading get interface "$nicName" external-ids:pod_netns | tr -d '\r' | sed -e 's/^"//' -e 's/"$//')
     set -x
-    kubectl exec "$ovnCni" -n $KUBE_OVN_NS -- tcpdump -nn -i "$nicName" "$@"
+    if [ "$podNicType" = "internal-port" ]; then
+      kubectl exec "$ovnCni" -n $KUBE_OVN_NS -- nsenter --net="$podNetNs" tcpdump -nn -i "$nicName" "$@"
+    else
+      kubectl exec "$ovnCni" -n $KUBE_OVN_NS -- nsenter --net="$podNetNs" tcpdump -nn -i eth0 "$@"
+    fi
   fi
 }
 
@@ -2173,7 +2292,45 @@ trace(){
     exit 1
   fi
 
-  gwMac=$(kubectl exec $OVN_NB_POD -n $KUBE_OVN_NS -c ovn-central -- ovn-nbctl --data=bare --no-heading --columns=mac find logical_router_port name=ovn-cluster-"$ls" | tr -d '\r')
+  vlan=$(kubectl get subnet "$ls" -o jsonpath={.spec.vlan})
+  underlayGateway=$(kubectl get subnet "$ls" -o jsonpath={.spec.underlayGateway})
+
+  gwMac=""
+  if [ ! -z "$vlan" -a "$underlayGateway" = "true" ]; then
+    ovnCni=$(kubectl get pod -n $KUBE_OVN_NS -o wide | grep -w kube-ovn-cni | grep " $nodeName " | awk '{print $1}')
+    if [ -z "$ovnCni" ]; then
+      echo "No kube-ovn-cni Pod running on node $nodeName"
+      exit 1
+    fi
+
+    nicName=$(kubectl exec "$ovnCni" -n $KUBE_OVN_NS -- ovs-vsctl --data=bare --no-heading --columns=name find interface external-ids:iface-id="$podName"."$namespace" | tr -d '\r')
+    if [ -z "$nicName" ]; then
+      echo "nic doesn't exist on node $nodeName"
+      exit 1
+    fi
+
+    gateway=$(kubectl get subnet "$ls" -o jsonpath={.spec.gateway})
+    podNetNs=$(kubectl exec "$ovnCni" -n $KUBE_OVN_NS -- ovs-vsctl --data=bare --no-heading get interface "$nicName" external-ids:pod_netns | tr -d '\r' | sed -e 's/^"//' -e 's/"$//')
+
+    podNicType=$(kubectl get pod "$podName" -n "$namespace" -o jsonpath={.metadata.annotations.ovn\\.kubernetes\\.io/pod_nic_type})
+    if [ "$podNicType" != "internal-port" ]; then
+      nicName="eth0"
+    fi
+
+    if [[ "$gateway" =~ .*:.* ]]; then
+      output=$(kubectl exec "$ovnCni" -n $KUBE_OVN_NS -- nsenter --net="$podNetNs" ndisc6 -q "$gateway" "$nicName")
+    else
+      output=$(kubectl exec "$ovnCni" -n $KUBE_OVN_NS -- nsenter --net="$podNetNs" arping -c3 -C1 -i1 -I "$nicName" "$gateway")
+    fi
+
+    if [ $? -ne 0 ]; then
+      echo "failed to run 'arping -c1 -i $nicName $gateway' in Pod netns"
+      exit 1
+    fi
+    gwMac=$(echo "$output" | grep -o -E '([[:xdigit:]]{1,2}:){5}[[:xdigit:]]{1,2}')
+  else
+    gwMac=$(kubectl exec $OVN_NB_POD -n $KUBE_OVN_NS -c ovn-central -- ovn-nbctl --data=bare --no-heading --columns=mac find logical_router_port name=ovn-cluster-"$ls" | tr -d '\r')
+  fi
 
   if [ -z "$gwMac" ]; then
     echo "get gw mac failed"
@@ -2188,14 +2345,23 @@ trace(){
 
   type="$3"
 
+  af="4"
+  nw="nw"
+  proto=""
+  if [[ "$podIP" =~ .*:.* ]]; then
+    af="6"
+    nw="ipv6"
+    proto="6"
+  fi
+
   case $type in
     icmp)
       set -x
-      kubectl exec "$OVN_SB_POD" -n $KUBE_OVN_NS -c ovn-central -- ovn-trace --ct=new "$ls" "inport == \"$podName.$namespace\" && ip.ttl == 64 && icmp && eth.src == $mac && ip4.src == $podIP && eth.dst == $gwMac && ip4.dst == $dst"
+      kubectl exec "$OVN_SB_POD" -n $KUBE_OVN_NS -c ovn-central -- ovn-trace --ct=new "$ls" "inport == \"$podName.$namespace\" && ip.ttl == 64 && icmp && eth.src == $mac && ip$af.src == $podIP && eth.dst == $gwMac && ip$af.dst == $dst"
       ;;
     tcp|udp)
       set -x
-      kubectl exec "$OVN_SB_POD" -n $KUBE_OVN_NS -c ovn-central -- ovn-trace --ct=new "$ls" "inport == \"$podName.$namespace\" && ip.ttl == 64 && eth.src == $mac && ip4.src == $podIP && eth.dst == $gwMac && ip4.dst == $dst && $type.src == 10000 && $type.dst == $4"
+      kubectl exec "$OVN_SB_POD" -n $KUBE_OVN_NS -c ovn-central -- ovn-trace --ct=new "$ls" "inport == \"$podName.$namespace\" && ip.ttl == 64 && eth.src == $mac && ip$af.src == $podIP && eth.dst == $gwMac && ip$af.dst == $dst && $type.src == 10000 && $type.dst == $4"
       ;;
     *)
       echo "type $type not supported"
@@ -2212,19 +2378,19 @@ trace(){
 
   ovsPod=$(kubectl get pod -n $KUBE_OVN_NS -o wide | grep " $nodeName " | grep ovs-ovn | awk '{print $1}')
   if [ -z "$ovsPod" ]; then
-      echo "ovs pod  doesn't exist on node $nodeName"
-      exit 1
+    echo "ovs pod doesn't exist on node $nodeName"
+    exit 1
   fi
 
   inPort=$(kubectl exec "$ovsPod" -n $KUBE_OVN_NS -- ovs-vsctl --format=csv --data=bare --no-heading --columns=ofport find interface external_id:iface-id="$podName"."$namespace")
-    case $type in
+  case $type in
     icmp)
       set -x
-      kubectl exec "$ovsPod" -n $KUBE_OVN_NS -- ovs-appctl ofproto/trace br-int in_port="$inPort",icmp,nw_src="$podIP",nw_dst="$dst",dl_src="$mac",dl_dst="$gwMac"
+      kubectl exec "$ovsPod" -n $KUBE_OVN_NS -- ovs-appctl ofproto/trace br-int "in_port=$inPort,icmp$proto,${nw}_src=$podIP,${nw}_dst=$dst,dl_src=$mac,dl_dst=$gwMac"
       ;;
     tcp|udp)
       set -x
-      kubectl exec "$ovsPod" -n $KUBE_OVN_NS -- ovs-appctl ofproto/trace br-int in_port="$inPort","$type",nw_src="$podIP",nw_dst="$dst",dl_src="$mac",dl_dst="$gwMac","$type"_src=1000,"$type"_dst="$4"
+      kubectl exec "$ovsPod" -n $KUBE_OVN_NS -- ovs-appctl ofproto/trace br-int "in_port=$inPort,$type$proto,${nw}_src=$podIP,${nw}_dst=$dst,dl_src=$mac,dl_dst=$gwMac,${type}_src=1000,${type}_dst=$4"
       ;;
     *)
       echo "type $type not supported"
@@ -2240,10 +2406,26 @@ xxctl(){
   kubectl get no "$nodeName" > /dev/null
   ovsPod=$(kubectl get pod -n $KUBE_OVN_NS -o wide | grep " $nodeName " | grep ovs-ovn | awk '{print $1}')
   if [ -z "$ovsPod" ]; then
-      echo "ovs pod  doesn't exist on node $nodeName"
-      exit 1
+    echo "ovs pod  doesn't exist on node $nodeName"
+    exit 1
   fi
   kubectl exec "$ovsPod" -n $KUBE_OVN_NS -- ovs-$subcommand "$@"
+}
+
+checkLeader(){
+  component="$1"; shift
+  count=$(kubectl get ep ovn-$component -n $KUBE_OVN_NS -o yaml | grep ip | wc -l)
+  if [ $count -eq 0 ]; then
+    echo "no ovn-$component exists !!"
+    exit 1
+  fi
+
+  if [ $count -gt 1 ]; then
+    echo "ovn-$component has more than one leader !!"
+    exit 1
+  fi
+
+  echo "ovn-$component leader check ok"
 }
 
 diagnose(){
@@ -2251,6 +2433,8 @@ diagnose(){
   kubectl get crd vpc-nat-gateways.kubeovn.io
   kubectl get crd subnets.kubeovn.io
   kubectl get crd ips.kubeovn.io
+  kubectl get crd vlans.kubeovn.io
+  kubectl get crd provider-networks.kubeovn.io
   kubectl get svc kube-dns -n kube-system
   kubectl get svc kubernetes -n default
   kubectl get sa -n kube-system ovn
@@ -2270,6 +2454,11 @@ diagnose(){
   checkDaemonSet kube-ovn-cni
   checkDaemonSet ovs-ovn
   checkDeployment coredns
+
+  checkLeader nb
+  checkLeader sb
+  checkLeader northd
+
   type="$1"
   case $type in
     all)
@@ -2379,6 +2568,53 @@ checkKubeProxy(){
   else
     checkDaemonSet kube-proxy
   fi
+  echo "kube-proxy ready"
+}
+
+dbtool(){
+  suffix=$(date +%m%d%H%M%s)
+  component="$1"; shift
+  action="$1"; shift
+  case $component in
+    nb)
+      case $action in
+        status)
+          kubectl exec "$OVN_NB_POD" -n $KUBE_OVN_NS -c ovn-central -- ovs-appctl -t /var/run/ovn/ovnnb_db.ctl cluster/status OVN_Northbound
+          ;;
+        kick)
+          kubectl exec "$OVN_NB_POD" -n $KUBE_OVN_NS -c ovn-central -- ovs-appctl -t /var/run/ovn/ovnnb_db.ctl cluster/kick OVN_Northbound "$1"
+          ;;
+        backup)
+          kubectl exec "$OVN_NB_POD" -n $KUBE_OVN_NS -c ovn-central -- ovsdb-tool cluster-to-standalone /etc/ovn/ovnnb_db.$suffix.backup /etc/ovn/ovnnb_db.db
+          kubectl cp $KUBE_OVN_NS/$OVN_NB_POD:/etc/ovn/ovnnb_db.$suffix.backup $(pwd)/ovnnb_db.$suffix.backup
+          kubectl exec "$OVN_NB_POD" -n $KUBE_OVN_NS -c ovn-central -- rm -f /etc/ovn/ovnnb_db.$suffix.backup
+          echo "backup $component to $(pwd)/ovnnb_db.$suffix.backup"
+          ;;
+        *)
+          echo "unknown action $action"
+      esac
+      ;;
+    sb)
+      case $action in
+        status)
+          kubectl exec "$OVN_SB_POD" -n $KUBE_OVN_NS -c ovn-central -- ovs-appctl -t /var/run/ovn/ovnsb_db.ctl cluster/status OVN_Southbound
+          ;;
+        kick)
+          kubectl exec "$OVN_SB_POD" -n $KUBE_OVN_NS -c ovn-central -- ovs-appctl -t /var/run/ovn/ovnsb_db.ctl cluster/kick OVN_Southbound "$1"
+          ;;
+        backup)
+          kubectl exec "$OVN_SB_POD" -n $KUBE_OVN_NS -c ovn-central -- ovsdb-tool cluster-to-standalone /etc/ovn/ovnsb_db.$suffix.backup /etc/ovn/ovnsb_db.db
+          kubectl cp $KUBE_OVN_NS/$OVN_SB_POD:/etc/ovn/ovnsb_db.$suffix.backup $(pwd)/ovnsb_db.$suffix.backup
+          kubectl exec "$OVN_SB_POD" -n $KUBE_OVN_NS -c ovn-central -- rm -f /etc/ovn/ovnsb_db.$suffix.backup
+          echo "backup $component to $(pwd)/ovnsb_db.$suffix.backup"
+          ;;
+        *)
+          echo "unknown action $action"
+      esac
+      ;;
+    *)
+      echo "unknown subcommand $component"
+  esac
 }
 
 if [ $# -lt 1 ]; then
@@ -2399,6 +2635,9 @@ case $subcommand in
     ;;
   vsctl|ofctl|dpctl|appctl)
     xxctl "$subcommand" "$@"
+    ;;
+  nb|sb)
+    dbtool "$subcommand" "$@"
     ;;
   tcpdump)
     tcpdump "$@"

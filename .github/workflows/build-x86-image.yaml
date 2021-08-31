@@ -23,7 +23,7 @@ jobs:
       - name: Set up Go 1.x
         uses: actions/setup-go@v2
         with:
-          go-version: ^1.16
+          go-version: 1.16.7
         id: go
 
       - name: Check out code into the Go module directory
@@ -87,7 +87,7 @@ jobs:
 
       - name: Install Kind
         env:
-          KIND_VERSION: v0.9.0
+          KIND_VERSION: v0.11.1
         run: |
           curl -Lo ./kind https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-$(uname)-amd64
           chmod +x ./kind
@@ -123,9 +123,9 @@ jobs:
           sudo chmod 666 /home/runner/.kube/config
           make e2e
 
-  single-vlan-e2e:
+  single-iptables-e2e:
     needs: build
-    name: 1-master-vlan-e2e
+    name: 1-master-iptables-e2e
     runs-on: ubuntu-18.04
     timeout-minutes: 30
     steps:
@@ -134,7 +134,54 @@ jobs:
 
       - name: Install Kind
         env:
-          KIND_VERSION: v0.9.0
+          KIND_VERSION: v0.11.1
+        run: |
+          curl -Lo ./kind https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-$(uname)-amd64
+          chmod +x ./kind
+          sudo mv kind /usr/local/bin
+
+      - name: Init Kind
+        run: |
+          pip install j2cli --user
+          pip install "j2cli[yaml]" --user
+          sudo PATH=~/.local/bin:$PATH make kind-init-iptables
+
+      - name: Download image
+        uses: actions/download-artifact@v2
+        with:
+          name: image
+
+      - name: Install Kube-OVN
+        run: |
+          docker load --input image.tar
+          sudo make kind-install
+
+      - name: Set up Go 1.x
+        uses: actions/setup-go@v2
+        with:
+          go-version: ^1.16
+        id: go
+
+      - name: Run E2E
+        run: |
+          go get -u github.com/onsi/ginkgo/ginkgo
+          go get -u github.com/onsi/gomega/...
+          sudo kubectl cluster-info
+          sudo chmod 666 /home/runner/.kube/config
+          make e2e
+
+  single-vlan-e2e-single-nic:
+    needs: build
+    name: 1-master-vlan-e2e-single-nic
+    runs-on: ubuntu-18.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+
+      - name: Install Kind
+        env:
+          KIND_VERSION: v0.11.1
         run: |
           curl -Lo ./kind https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-$(uname)-amd64
           chmod +x ./kind
@@ -168,7 +215,7 @@ jobs:
           go get -u github.com/onsi/gomega/...
           sudo kubectl cluster-info
           sudo chmod 666 /home/runner/.kube/config
-          make e2e-vlan
+          make e2e-vlan-single-nic
 
   single-node-e2e:
     needs: build
@@ -181,7 +228,7 @@ jobs:
 
       - name: Install Kind
         env:
-          KIND_VERSION: v0.9.0
+          KIND_VERSION: v0.11.1
         run: |
           curl -Lo ./kind https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-$(uname)-amd64
           chmod +x ./kind
@@ -228,7 +275,7 @@ jobs:
 
       - name: Install Kind
         env:
-          KIND_VERSION: v0.9.0
+          KIND_VERSION: v0.11.1
         run: |
           curl -Lo ./kind https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-$(uname)-amd64
           chmod +x ./kind
@@ -261,7 +308,7 @@ jobs:
 
       - name: Install Kind
         env:
-          KIND_VERSION: v0.9.0
+          KIND_VERSION: v0.11.1
         run: |
           curl -Lo ./kind https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-$(uname)-amd64
           chmod +x ./kind
@@ -287,9 +334,23 @@ jobs:
           docker load --input image.tar
           sudo make kind-install-ipv6
 
-  ipv6-vlan-e2e:
+      - name: Set up Go 1.x
+        uses: actions/setup-go@v2
+        with:
+          go-version: ^1.16
+        id: go
+
+      - name: Run E2E
+        run: |
+          go get -u github.com/onsi/ginkgo/ginkgo
+          go get -u github.com/onsi/gomega/...
+          sudo kubectl cluster-info
+          sudo chmod 666 /home/runner/.kube/config
+          make e2e-ipv6
+
+  ipv6-vlan-e2e-single-nic:
     needs: build
-    name: ipv6-vlan-e2e
+    name: ipv6-vlan-e2e-single-nic
     runs-on: ubuntu-18.04
     timeout-minutes: 30
     steps:
@@ -298,7 +359,7 @@ jobs:
 
       - name: Install Kind
         env:
-          KIND_VERSION: v0.9.0
+          KIND_VERSION: v0.11.1
         run: |
           curl -Lo ./kind https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-$(uname)-amd64
           chmod +x ./kind
@@ -336,16 +397,117 @@ jobs:
           go get -u github.com/onsi/gomega/...
           sudo kubectl cluster-info
           sudo chmod 666 /home/runner/.kube/config
-          make e2e-vlan
+          make e2e-vlan-single-nic
+
+  no-lb-e2e:
+    needs: build
+    name: disable-loadbalancer-e2e
+    runs-on: ubuntu-18.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+
+      - name: Install Kind
+        env:
+          KIND_VERSION: v0.11.1
+        run: |
+          curl -Lo ./kind https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-$(uname)-amd64
+          chmod +x ./kind
+          sudo mv kind /usr/local/bin
+
+      - name: Init Kind
+        run: |
+          pip install j2cli --user
+          pip install "j2cli[yaml]" --user
+          sudo PATH=~/.local/bin:$PATH make kind-init
+
+      - name: Download image
+        uses: actions/download-artifact@v2
+        with:
+          name: image
+
+      - name: Install Kube-OVN without LoadBalancer
+        env:
+          ENABLE_LB: "false"
+        run: |
+          docker load --input image.tar
+          sudo make kind-install
+
+      - name: Set up Go 1.x
+        uses: actions/setup-go@v2
+        with:
+          go-version: ^1.16
+        id: go
+
+      - name: Run E2E
+        run: |
+          go get -u github.com/onsi/ginkgo/ginkgo
+          go get -u github.com/onsi/gomega/...
+          sudo kubectl cluster-info
+          sudo chmod 666 /home/runner/.kube/config
+          make e2e
+
+  no-lb-iptables-e2e:
+    needs: build
+    name: disable-loadbalancer-iptables-e2e
+    runs-on: ubuntu-18.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+
+      - name: Install Kind
+        env:
+          KIND_VERSION: v0.11.1
+        run: |
+          curl -Lo ./kind https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-$(uname)-amd64
+          chmod +x ./kind
+          sudo mv kind /usr/local/bin
+
+      - name: Init Kind
+        run: |
+          pip install j2cli --user
+          pip install "j2cli[yaml]" --user
+          sudo PATH=~/.local/bin:$PATH make kind-init-iptables
+
+      - name: Download image
+        uses: actions/download-artifact@v2
+        with:
+          name: image
+
+      - name: Install Kube-OVN without LoadBalancer
+        env:
+          ENABLE_LB: "false"
+        run: |
+          docker load --input image.tar
+          sudo make kind-install
+
+      - name: Set up Go 1.x
+        uses: actions/setup-go@v2
+        with:
+          go-version: ^1.16
+        id: go
+
+      - name: Run E2E
+        run: |
+          go get -u github.com/onsi/ginkgo/ginkgo
+          go get -u github.com/onsi/gomega/...
+          sudo kubectl cluster-info
+          sudo chmod 666 /home/runner/.kube/config
+          make e2e
 
   push:
     needs:
       - single-e2e
-      - single-vlan-e2e
+      - single-iptables-e2e
+      - single-vlan-e2e-single-nic
       - single-node-e2e
       - ha-e2e
       - ipv6-e2e
-      - ipv6-vlan-e2e
+      - ipv6-vlan-e2e-single-nic
+      - no-lb-e2e
+      - no-lb-iptables-e2e
     name: push
     runs-on: ubuntu-18.04
     steps:

@@ -63,6 +63,20 @@ func (f *Framework) GetName() string {
 	return strings.Replace(CurrentGinkgoTestDescription().TestText, " ", "-", -1)
 }
 
+func (f *Framework) WaitProviderNetworkReady(providerNetwork string) error {
+	for {
+		time.Sleep(1 * time.Second)
+
+		pn, err := f.OvnClientSet.KubeovnV1().ProviderNetworks().Get(context.Background(), providerNetwork, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		if pn.Status.Ready {
+			return nil
+		}
+	}
+}
+
 func (f *Framework) WaitSubnetReady(subnet string) error {
 	for {
 		time.Sleep(1 * time.Second)
@@ -79,27 +93,27 @@ func (f *Framework) WaitSubnetReady(subnet string) error {
 	}
 }
 
-func (f *Framework) WaitPodReady(pod, namespace string) error {
+func (f *Framework) WaitPodReady(pod, namespace string) (*corev1.Pod, error) {
 	for {
 		time.Sleep(1 * time.Second)
 		p, err := f.KubeClientSet.CoreV1().Pods(namespace).Get(context.Background(), pod, metav1.GetOptions{})
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if p.Status.Phase == "Running" && p.Status.Reason != "" {
-			return nil
+			return p, nil
 		}
 
 		switch getPodStatus(*p) {
 		case Completed:
-			return fmt.Errorf("pod already completed")
+			return nil, fmt.Errorf("pod already completed")
 		case Running:
-			return nil
+			return p, nil
 		case Initing, Pending, PodInitializing, ContainerCreating, Terminating:
 			continue
 		default:
 			fmt.Printf("%v", p.String())
-			return fmt.Errorf("pod status failed")
+			return nil, fmt.Errorf("pod status failed")
 		}
 	}
 }

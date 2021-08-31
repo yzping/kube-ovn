@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"math"
 	"net"
 	"reflect"
 	"strconv"
@@ -72,7 +71,13 @@ func (c *Controller) enqueueUpdateSubnet(old, new interface{}) {
 		return
 	}
 
-	if !newSubnet.DeletionTimestamp.IsZero() && newSubnet.Status.UsingIPs == 0 {
+	var usingIPs float64
+	if newSubnet.Spec.Protocol == kubeovnv1.ProtocolIPv6 {
+		usingIPs = newSubnet.Status.V6UsingIPs
+	} else {
+		usingIPs = newSubnet.Status.V4UsingIPs
+	}
+	if !newSubnet.DeletionTimestamp.IsZero() && usingIPs == 0 {
 		c.addOrUpdateSubnetQueue.Add(key)
 		return
 	}
@@ -214,7 +219,7 @@ func (c *Controller) processNextDeleteSubnetWorkItem() bool {
 		var ok bool
 		if subnet, ok = obj.(*kubeovnv1.Subnet); !ok {
 			c.deleteSubnetQueue.Forget(obj)
-			utilruntime.HandleError(fmt.Errorf("expected string in workqueue but got %#v", obj))
+			utilruntime.HandleError(fmt.Errorf("expected subnet in workqueue but got %#v", obj))
 			return nil
 		}
 		if err := c.handleDeleteSubnet(subnet); err != nil {
@@ -259,12 +264,6 @@ func formatSubnet(subnet *kubeovnv1.Subnet, c *Controller) error {
 		// Some features only work in the default VPC
 		if subnet.Spec.Default && subnet.Name != c.config.DefaultLogicalSwitch {
 			subnet.Spec.Default = false
-		}
-		if util.IsNetworkVlan(c.config.NetworkType) && subnet.Spec.Vlan == "" {
-			subnet.Spec.Vlan = c.config.DefaultVlanName
-			if c.config.DefaultVlanID == 0 {
-				subnet.Spec.UnderlayGateway = true
-			}
 		}
 		if subnet.Spec.Vlan != "" {
 			if _, err := c.vlansLister.Get(subnet.Spec.Vlan); err != nil {
@@ -547,12 +546,12 @@ func (c *Controller) handleAddOrUpdateSubnet(key string) error {
 		}
 	}
 
-	nodes, err := c.nodesLister.List(labels.Everything())
-	if err != nil {
-		klog.Errorf("failed to list nodes %v", err)
-		return err
-	}
-	if subnet.Spec.Vpc != util.DefaultVpc && subnet.Spec.Vlan != "" && !subnet.Spec.UnderlayGateway {
+	if subnet.Spec.Vlan == "" && subnet.Spec.Vpc == util.DefaultVpc {
+		nodes, err := c.nodesLister.List(labels.Everything())
+		if err != nil {
+			klog.Errorf("failed to list nodes %v", err)
+			return err
+		}
 		for _, node := range nodes {
 			for _, addr := range node.Status.Addresses {
 				if addr.Type == v1.NodeInternalIP && util.CIDRContainIP(subnet.Spec.CIDRBlock, addr.Address) {
@@ -616,6 +615,30 @@ func (c *Controller) handleAddOrUpdateSubnet(key string) error {
 	}
 
 	c.updateVpcStatusQueue.Add(subnet.Spec.Vpc)
+
+	if subnet.Spec.Vlan != "" {
+		vlan, err := c.vlansLister.Get(subnet.Spec.Vlan)
+		if err != nil {
+			klog.Errorf("failed to get vlan %s: %v", vlan.Spec.Provider, err)
+			return err
+		}
+
+		if !util.ContainsString(vlan.Status.Subnets, subnet.Name) {
+			vlan.Status.Subnets = append(vlan.Status.Subnets, subnet.Name)
+			bytes, err := vlan.Status.Bytes()
+			if err != nil {
+				klog.Error(err)
+				return err
+			}
+
+			_, err = c.config.KubeOvnClient.KubeovnV1().Vlans().Patch(context.Background(), vlan.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
+			if err != nil {
+				klog.Errorf("failed to patch vlan %s: %v", vlan.Name, err)
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -684,27 +707,7 @@ func (c *Controller) handleDeleteLogicalSwitch(key string) error {
 		}
 	}
 
-	// re-annotate vlan subnet
-	if util.IsNetworkVlan(c.config.NetworkType) {
-		if err = c.delLocalnet(key); err != nil {
-			return err
-		}
-
-		vlans, err := c.vlansLister.List(labels.Everything())
-		if err != nil {
-			klog.Errorf("failed to list vlan, %v", err)
-			return err
-		}
-
-		for _, vlan := range vlans {
-			subnet := strings.Split(vlan.Spec.Subnet, ",")
-			if util.IsStringIn(key, subnet) {
-				c.updateVlanQueue.Add(vlan.Name)
-			}
-		}
-	}
-
-	return nil
+	return c.delLocalnet(key)
 }
 
 func (c *Controller) handleDeleteSubnet(subnet *kubeovnv1.Subnet) error {
@@ -732,6 +735,45 @@ func (c *Controller) handleDeleteSubnet(subnet *kubeovnv1.Subnet) error {
 		}
 	}
 
+	vlans, err := c.vlansLister.List(labels.Everything())
+	if err != nil && !k8serrors.IsNotFound(err) {
+		klog.Errorf("failed to list vlans: %v", err)
+		return err
+	}
+
+	for _, vlan := range vlans {
+		if err = c.updateVlanStatusForSubnetDeletion(vlan, subnet.Name); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (c *Controller) updateVlanStatusForSubnetDeletion(vlan *kubeovnv1.Vlan, subnet string) error {
+	if util.ContainsString(vlan.Status.Subnets, subnet) {
+		vlan.Status.Subnets = util.RemoveString(vlan.Status.Subnets, subnet)
+		if len(vlan.Status.Subnets) == 0 {
+			bytes := []byte(`[{ "op": "remove", "path": "/status/subnets"}]`)
+			_, err := c.config.KubeOvnClient.KubeovnV1().Vlans().Patch(context.Background(), vlan.Name, types.JSONPatchType, bytes, metav1.PatchOptions{})
+			if err != nil {
+				klog.Errorf("failed to patch vlan %s: %v", vlan.Name, err)
+				return err
+			}
+		} else {
+			bytes, err := vlan.Status.Bytes()
+			if err != nil {
+				klog.Error(err)
+				return err
+			}
+
+			_, err = c.config.KubeOvnClient.KubeovnV1().Vlans().Patch(context.Background(), vlan.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
+			if err != nil {
+				klog.Errorf("failed to patch vlan %s: %v", vlan.Name, err)
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -784,7 +826,7 @@ func (c *Controller) reconcileNamespaces(subnet *kubeovnv1.Subnet) error {
 		}
 		if changed {
 			sub.Spec.Namespaces = reservedNamespaces
-			subnet, err = c.config.KubeOvnClient.KubeovnV1().Subnets().Update(context.Background(), sub, metav1.UpdateOptions{})
+			_, err = c.config.KubeOvnClient.KubeovnV1().Subnets().Update(context.Background(), sub, metav1.UpdateOptions{})
 			if err != nil {
 				klog.Errorf("failed to unbind namespace from subnet %s, %v", sub.Name, err)
 				return err
@@ -907,7 +949,7 @@ func (c *Controller) reconcileGateway(subnet *kubeovnv1.Subnet) error {
 				return fmt.Errorf("failed to add ecmp static route, no gateway node exists")
 			}
 
-			nodeIPs := make([]string, len(strings.Split(subnet.Spec.GatewayNode, ",")))
+			nodeIPs := make([]string, 0, len(strings.Split(subnet.Spec.GatewayNode, ",")))
 			for _, gw := range strings.Split(subnet.Spec.GatewayNode, ",") {
 				gw = strings.TrimSpace(gw)
 				node, err := c.nodesLister.Get(gw)
@@ -965,33 +1007,12 @@ func (c *Controller) deleteStaticRoute(ip, router string, subnet *kubeovnv1.Subn
 }
 
 func (c *Controller) reconcileVlan(subnet *kubeovnv1.Subnet) error {
-	if !util.IsNetworkVlan(c.config.NetworkType) {
-		return nil
-	}
-
-	klog.Infof("reconcile vlan, %v", subnet.Spec.Vlan)
-
 	if subnet.Spec.Vlan != "" {
+		klog.Infof("reconcile vlan, %v", subnet.Spec.Vlan)
 		//create subnet localnet
 		if err := c.addLocalnet(subnet); err != nil {
 			klog.Errorf("failed add localnet to subnet, %v", err)
 			return err
-		}
-
-		c.updateVlanQueue.Add(subnet.Spec.Vlan)
-	}
-
-	//update unbind vlan
-	vlanLists, err := c.vlansLister.List(labels.Everything())
-	if err != nil {
-		klog.Errorf("failed to list vlans, %v", err)
-		return err
-	}
-
-	for _, vlan := range vlanLists {
-		subnets := strings.Split(vlan.Spec.Subnet, ",")
-		if util.IsStringIn(subnet.Name, subnets) {
-			c.updateVlanQueue.Add(vlan.Name)
 		}
 	}
 
@@ -1030,21 +1051,19 @@ func calcDualSubnetStatusIP(subnet *kubeovnv1.Subnet, c *Controller) error {
 			v6UsingIPs = append(v6UsingIPs, splitIPs[1])
 		}
 	}
-	v4availableIPs := util.AddressCount(v4CIDR) - float64(util.CountIpNums(v4toSubIPs))
+	v4availableIPs := util.AddressCount(v4CIDR) - util.CountIpNums(v4toSubIPs)
 	if v4availableIPs < 0 {
 		v4availableIPs = 0
 	}
-	v6availableIPs := util.AddressCount(v6CIDR) - float64(util.CountIpNums(v6toSubIPs))
+	v6availableIPs := util.AddressCount(v6CIDR) - util.CountIpNums(v6toSubIPs)
 	if v6availableIPs < 0 {
 		v6availableIPs = 0
 	}
 
 	subnet.Status.V4AvailableIPs = v4availableIPs
 	subnet.Status.V6AvailableIPs = v6availableIPs
-	subnet.Status.AvailableIPs = math.Min(v4availableIPs, v6availableIPs)
 	subnet.Status.V4UsingIPs = float64(len(v4UsingIPs))
 	subnet.Status.V6UsingIPs = float64(len(v6UsingIPs))
-	subnet.Status.UsingIPs = subnet.Status.V4UsingIPs
 
 	bytes, err := subnet.Status.Bytes()
 	if err != nil {
@@ -1070,13 +1089,11 @@ func calcSubnetStatusIP(subnet *kubeovnv1.Subnet, c *Controller) error {
 	for _, podUsedIP := range podUsedIPs.Items {
 		toSubIPs = append(toSubIPs, podUsedIP.Spec.IPAddress)
 	}
-	availableIPs := util.AddressCount(cidr) - float64(util.CountIpNums(toSubIPs))
+	availableIPs := util.AddressCount(cidr) - util.CountIpNums(toSubIPs)
 	if availableIPs < 0 {
 		availableIPs = 0
 	}
 	usingIPs := float64(len(podUsedIPs.Items))
-	subnet.Status.AvailableIPs = availableIPs
-	subnet.Status.UsingIPs = usingIPs
 	if util.CheckProtocol(subnet.Spec.CIDRBlock) == kubeovnv1.ProtocolIPv4 {
 		subnet.Status.V4AvailableIPs = availableIPs
 		subnet.Status.V4UsingIPs = usingIPs
@@ -1107,7 +1124,7 @@ func (c *Controller) getSubnetVlanTag(subnet *kubeovnv1.Subnet) (string, error) 
 		if err != nil {
 			return "", err
 		}
-		tag = strconv.Itoa(vlan.Spec.VlanId)
+		tag = strconv.Itoa(vlan.Spec.ID)
 	}
 	return tag, nil
 }

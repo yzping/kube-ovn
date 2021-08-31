@@ -18,7 +18,7 @@ import (
 
 func (c Client) ovnNbCommand(cmdArgs ...string) (string, error) {
 	start := time.Now()
-	cmdArgs = append([]string{fmt.Sprintf("--timeout=%d", c.OvnTimeout)}, cmdArgs...)
+	cmdArgs = append([]string{fmt.Sprintf("--timeout=%d", c.OvnTimeout), "--wait=sb"}, cmdArgs...)
 	raw, err := exec.Command(OvnNbCtl, cmdArgs...).CombinedOutput()
 	elapsed := float64((time.Since(start)) / time.Millisecond)
 	klog.V(4).Infof("command %s %s in %vms, output %q", OvnNbCtl, strings.Join(cmdArgs, " "), elapsed, raw)
@@ -141,6 +141,9 @@ func (c Client) CreatePort(ls, port, ip, cidr, mac, tag, pod, namespace string, 
 	if pod != "" && namespace != "" {
 		ovnCommand = append(ovnCommand,
 			"--", "set", "logical_switch_port", port, fmt.Sprintf("external_ids:pod=%s/%s", namespace, pod), fmt.Sprintf("external_ids:vendor=%s", util.CniTypeName))
+	} else {
+		ovnCommand = append(ovnCommand,
+			"--", "set", "logical_switch_port", port, fmt.Sprintf("external_ids:vendor=%s", util.CniTypeName))
 	}
 
 	if _, err := c.ovnNbCommand(ovnCommand...); err != nil {
@@ -460,7 +463,10 @@ func (c Client) createRouterPort(ls, lr, ip, mac string) error {
 		klog.Errorf("failed to create switch router port %s %v", lsTolr, err)
 		return err
 	}
-
+	if len(ip) == 0 {
+		klog.Errorf("failed to create switch router port: ip is empty")
+		return err
+	}
 	ipStr := strings.Split(ip, ",")
 	if len(ipStr) == 2 {
 		_, err = c.ovnNbCommand(MayExist, "lrp-add", lr, lrTols, mac, ipStr[0], ipStr[1])
@@ -532,6 +538,8 @@ func (c Client) GetStaticRouteList(router string) (routeList []*StaticRoute, err
 	return parseLrRouteListOutput(output)
 }
 
+var routeRegexp = regexp.MustCompile(`^\s*((\d+(\.\d+){3})|(([a-f0-9:]*:+)+[a-f0-9]?))(/\d+)?\s+((\d+(\.\d+){3})|(([a-f0-9:]*:+)+[a-f0-9]?))\s+(dst-ip|src-ip)(\s+.+)?$`)
+
 func parseLrRouteListOutput(output string) (routeList []*StaticRoute, err error) {
 	lines := strings.Split(output, "\n")
 	routeList = make([]*StaticRoute, 0, len(lines))
@@ -543,15 +551,16 @@ func parseLrRouteListOutput(output string) (routeList []*StaticRoute, err error)
 		if len(l) == 0 {
 			continue
 		}
-		reg := regexp.MustCompile(`(\d+.\d+.\d+.\d+(/\d+)*)\s+(\d+.\d+.\d+.\d+)\s+(dst-ip|src-ip)`)
-		sm := reg.FindStringSubmatch(l)
-		if len(sm) == 0 {
+
+		if !routeRegexp.MatchString(l) {
 			continue
 		}
+
+		fields := strings.Fields(l)
 		routeList = append(routeList, &StaticRoute{
-			Policy:  sm[4],
-			CIDR:    sm[1],
-			NextHop: sm[3],
+			Policy:  fields[2],
+			CIDR:    fields[0],
+			NextHop: fields[1],
 		})
 	}
 	return routeList, nil
@@ -624,6 +633,14 @@ func (c Client) DeleteNatRule(logicalIP, router string) error {
 	return err
 }
 
+func (c Client) DeleteMatchedStaticRoute(cidr, nexthop, router string) error {
+	if cidr == "" || nexthop == "" {
+		return nil
+	}
+	_, err := c.ovnNbCommand(IfExists, "lr-route-del", router, cidr, nexthop)
+	return err
+}
+
 // DeleteStaticRoute delete a static route rule in ovn
 func (c Client) DeleteStaticRoute(cidr, router string) error {
 	if cidr == "" {
@@ -659,7 +676,7 @@ func (c Client) DeleteStaticRouteByNextHop(nextHop string) error {
 func (c Client) FindLoadbalancer(lb string) (string, error) {
 	output, err := c.ovnNbCommand("--data=bare", "--no-heading", "--columns=_uuid",
 		"find", "load_balancer", fmt.Sprintf("name=%s", lb))
-	count := len(strings.Split(output, "\n"))
+	count := len(strings.FieldsFunc(output, func(c rune) bool { return c == '\n' }))
 	if count > 1 {
 		klog.Errorf("%s has %d lb entries", lb, count)
 		return "", fmt.Errorf("%s has %d lb entries", lb, count)
@@ -961,16 +978,14 @@ func (c Client) CreateIngressACL(npName, pgName, asIngressName, asExceptName, pr
 		ipSuffix = "ip6"
 	}
 	pgAs := fmt.Sprintf("%s_%s", pgName, ipSuffix)
-	exceptArgs := []string{MayExist, "--type=port-group", "--log", fmt.Sprintf("--name=%s", npName), fmt.Sprintf("--severity=%s", "warning"), "acl-add", pgName, "to-lport", util.IngressExceptDropPriority, fmt.Sprintf("%s.src == $%s && %s.dst == $%s", ipSuffix, asExceptName, ipSuffix, pgAs), "drop"}
-	defaultArgs := []string{"--", MayExist, "--type=port-group", "--log", fmt.Sprintf("--name=%s", npName), fmt.Sprintf("--severity=%s", "warning"), "acl-add", pgName, "to-lport", util.IngressDefaultDrop, fmt.Sprintf("%s.dst == $%s", ipSuffix, pgAs), "drop"}
-	ovnArgs := append(exceptArgs, defaultArgs...)
+	ovnArgs := []string{MayExist, "--type=port-group", "--log", fmt.Sprintf("--name=%s", npName), fmt.Sprintf("--severity=%s", "warning"), "acl-add", pgName, "to-lport", util.IngressDefaultDrop, fmt.Sprintf("%s.dst == $%s", ipSuffix, pgAs), "drop"}
 
 	if len(npp) == 0 {
-		allowArgs := []string{"--", MayExist, "--type=port-group", "acl-add", pgName, "to-lport", util.IngressAllowPriority, fmt.Sprintf("%s.src == $%s && %s.dst == $%s", ipSuffix, asIngressName, ipSuffix, pgAs), "allow-related"}
+		allowArgs := []string{"--", MayExist, "--type=port-group", "acl-add", pgName, "to-lport", util.IngressAllowPriority, fmt.Sprintf("%s.src == $%s && %s.src != $%s && %s.dst == $%s", ipSuffix, asIngressName, ipSuffix, asExceptName, ipSuffix, pgAs), "allow-related"}
 		ovnArgs = append(ovnArgs, allowArgs...)
 	} else {
 		for _, port := range npp {
-			allowArgs := []string{"--", MayExist, "--type=port-group", "acl-add", pgName, "to-lport", util.IngressAllowPriority, fmt.Sprintf("%s.src == $%s && %s.dst == %d && %s.dst == $%s", ipSuffix, asIngressName, strings.ToLower(string(*port.Protocol)), port.Port.IntVal, ipSuffix, pgAs), "allow-related"}
+			allowArgs := []string{"--", MayExist, "--type=port-group", "acl-add", pgName, "to-lport", util.IngressAllowPriority, fmt.Sprintf("%s.src == $%s && %s.src != $%s && %s.dst == %d && %s.dst == $%s", ipSuffix, asIngressName, ipSuffix, asExceptName, strings.ToLower(string(*port.Protocol)), port.Port.IntVal, ipSuffix, pgAs), "allow-related"}
 			ovnArgs = append(ovnArgs, allowArgs...)
 		}
 	}
@@ -984,16 +999,14 @@ func (c Client) CreateEgressACL(npName, pgName, asEgressName, asExceptName, prot
 		ipSuffix = "ip6"
 	}
 	pgAs := fmt.Sprintf("%s_%s", pgName, ipSuffix)
-	exceptArgs := []string{MayExist, "--type=port-group", "--log", fmt.Sprintf("--name=%s", npName), fmt.Sprintf("--severity=%s", "warning"), "acl-add", pgName, "from-lport", util.EgressExceptDropPriority, fmt.Sprintf("%s.dst == $%s && %s.src == $%s", ipSuffix, asExceptName, ipSuffix, pgAs), "drop"}
-	defaultArgs := []string{"--", MayExist, "--type=port-group", "--log", fmt.Sprintf("--name=%s", npName), fmt.Sprintf("--severity=%s", "warning"), "acl-add", pgName, "from-lport", util.EgressDefaultDrop, fmt.Sprintf("%s.src == $%s", ipSuffix, pgAs), "drop"}
-	ovnArgs := append(exceptArgs, defaultArgs...)
+	ovnArgs := []string{"--", MayExist, "--type=port-group", "--log", fmt.Sprintf("--name=%s", npName), fmt.Sprintf("--severity=%s", "warning"), "acl-add", pgName, "from-lport", util.EgressDefaultDrop, fmt.Sprintf("%s.src == $%s", ipSuffix, pgAs), "drop"}
 
 	if len(npp) == 0 {
-		allowArgs := []string{"--", MayExist, "--type=port-group", "acl-add", pgName, "from-lport", util.EgressAllowPriority, fmt.Sprintf("%s.dst == $%s && %s.src == $%s", ipSuffix, asEgressName, ipSuffix, pgAs), "allow-related"}
+		allowArgs := []string{"--", MayExist, "--type=port-group", "acl-add", pgName, "from-lport", util.EgressAllowPriority, fmt.Sprintf("%s.dst == $%s && %s.dst != $%s && %s.src == $%s", ipSuffix, asEgressName, ipSuffix, asExceptName, ipSuffix, pgAs), "allow-related"}
 		ovnArgs = append(ovnArgs, allowArgs...)
 	} else {
 		for _, port := range npp {
-			allowArgs := []string{"--", MayExist, "--type=port-group", "acl-add", pgName, "from-lport", util.EgressAllowPriority, fmt.Sprintf("%s.dst == $%s && %s.dst == %d && %s.src == $%s", ipSuffix, asEgressName, strings.ToLower(string(*port.Protocol)), port.Port.IntVal, ipSuffix, pgAs), "allow-related"}
+			allowArgs := []string{"--", MayExist, "--type=port-group", "acl-add", pgName, "from-lport", util.EgressAllowPriority, fmt.Sprintf("%s.dst == $%s && %s.dst == $%s && %s.dst == %d && %s.src == $%s", ipSuffix, asEgressName, ipSuffix, asExceptName, strings.ToLower(string(*port.Protocol)), port.Port.IntVal, ipSuffix, pgAs), "allow-related"}
 			ovnArgs = append(ovnArgs, allowArgs...)
 		}
 	}

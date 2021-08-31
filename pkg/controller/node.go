@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -197,13 +198,51 @@ func (c *Controller) handleAddNode(key string) error {
 		return err
 	}
 
+	subnets, err := c.subnetsLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("failed to list subnets: %v", err)
+		return err
+	}
+
+	nodeIP := util.GetNodeInternalIP(*node)
+	for _, subnet := range subnets {
+		if subnet.Spec.Vlan == "" && subnet.Spec.Vpc == util.DefaultVpc && util.CIDRContainIP(subnet.Spec.CIDRBlock, nodeIP) {
+			msg := fmt.Sprintf("internal IP address of node %s is in CIDR of subnet %s, this may result in network issues", node.Name, subnet.Name)
+			klog.Warning(msg)
+			c.recorder.Eventf(&v1.Node{ObjectMeta: metav1.ObjectMeta{Name: node.Name, UID: types.UID(node.Name)}}, v1.EventTypeWarning, "NodeAddressConflictWithSubnet", msg)
+			break
+		}
+	}
+
+	providerNetworks, err := c.providerNetworksLister.List(labels.Everything())
+	if err != nil && !k8serrors.IsNotFound(err) {
+		klog.Errorf("failed to list provider networks: %v", err)
+		return err
+	}
+	for _, pn := range providerNetworks {
+		if !util.ContainsString(pn.Spec.ExcludeNodes, node.Name) {
+			if pn.Status.EnsureNodeStandardConditions(key) {
+				bytes, err := pn.Status.Bytes()
+				if err != nil {
+					klog.Error(err)
+					return err
+				}
+				_, err = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
+				if err != nil {
+					klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
+					return err
+				}
+			}
+		}
+	}
+
 	subnet, err := c.subnetsLister.Get(c.config.NodeSwitch)
 	if err != nil {
 		klog.Errorf("failed to get node subnet %v", err)
 		return err
 	}
 
-	if err := c.checkChassisDupl(node); err != nil {
+	if err := c.retryDelDupChassis(util.ChasRetryTime, util.ChasRetryIntev+2, c.checkChassisDupl, node); err != nil {
 		return err
 	}
 
@@ -218,7 +257,7 @@ func (c *Controller) handleAddNode(key string) error {
 			return err
 		}
 	} else {
-		v4IP, v6IP, mac, err = c.ipam.GetRandomAddress(portName, c.config.NodeSwitch)
+		v4IP, v6IP, mac, err = c.ipam.GetRandomAddress(portName, c.config.NodeSwitch, nil)
 		if err != nil {
 			klog.Errorf("failed to alloc random ip addrs for node %v, err %v", node.Name, err)
 			return err
@@ -250,6 +289,7 @@ func (c *Controller) handleAddNode(key string) error {
     }]`
 	op := "replace"
 	if len(node.Annotations) == 0 {
+		node.Annotations = map[string]string{}
 		op = "add"
 	}
 
@@ -299,6 +339,67 @@ func (c *Controller) handleDeleteNode(key string) error {
 	}
 
 	c.ipam.ReleaseAddressByPod(portName)
+
+	providerNetworks, err := c.providerNetworksLister.List(labels.Everything())
+	if err != nil && !k8serrors.IsNotFound(err) {
+		klog.Errorf("failed to list provider networks: %v", err)
+		return err
+	}
+
+	for _, pn := range providerNetworks {
+		if err = c.updateProviderNetworkStatusForNodeDeletion(pn, key); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (c *Controller) updateProviderNetworkStatusForNodeDeletion(pn *kubeovnv1.ProviderNetwork, node string) error {
+	if util.ContainsString(pn.Status.ReadyNodes, node) {
+		pn.Status.ReadyNodes = util.RemoveString(pn.Status.ReadyNodes, node)
+		if len(pn.Status.ReadyNodes) == 0 {
+			bytes := []byte(`[{ "op": "remove", "path": "/status/readyNodes"}]`)
+			_, err := c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.JSONPatchType, bytes, metav1.PatchOptions{})
+			if err != nil {
+				klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
+				return err
+			}
+		} else {
+			bytes, err := pn.Status.Bytes()
+			if err != nil {
+				klog.Error(err)
+				return err
+			}
+			_, err = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
+			if err != nil {
+				klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
+				return err
+			}
+		}
+	}
+	if pn.Status.RemoveNodeConditions(node) {
+		if len(pn.Status.Conditions) == 0 {
+			bytes := []byte(`[{ "op": "remove", "path": "/status/conditions"}]`)
+			_, err := c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.JSONPatchType, bytes, metav1.PatchOptions{})
+			if err != nil {
+				klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
+				return err
+			}
+		} else {
+			bytes, err := pn.Status.Bytes()
+			if err != nil {
+				klog.Error(err)
+				return err
+			}
+			_, err = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
+			if err != nil {
+				klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -316,7 +417,7 @@ func (c *Controller) handleUpdateNode(key string) error {
 		return err
 	}
 
-	if err := c.checkChassisDupl(node); err != nil {
+	if err := c.retryDelDupChassis(util.ChasRetryTime, util.ChasRetryIntev+2, c.checkChassisDupl, node); err != nil {
 		return err
 	}
 
@@ -420,9 +521,22 @@ func (c *Controller) checkGatewayReady() error {
 		}
 
 		for _, node := range nodes {
-			if util.GatewayContains(subnet.Spec.GatewayNode, node.Name) {
-				ipStr := node.Annotations[util.IpAddressAnnotation]
-				for _, ip := range strings.Split(ipStr, ",") {
+			ipStr := node.Annotations[util.IpAddressAnnotation]
+			for _, ip := range strings.Split(ipStr, ",") {
+				var cidrBlock string
+				for _, cidrBlock = range strings.Split(subnet.Spec.CIDRBlock, ",") {
+					if util.CheckProtocol(cidrBlock) != util.CheckProtocol(ip) {
+						continue
+					}
+				}
+
+				exist, err := c.checkNodeEcmpRouteExist(ip, cidrBlock)
+				if err != nil {
+					klog.Errorf("get ecmp static route for subnet %v, error %v", subnet.Name, err)
+					break
+				}
+
+				if util.GatewayContains(subnet.Spec.GatewayNode, node.Name) {
 					pinger, err := goping.NewPinger(ip)
 					if err != nil {
 						return fmt.Errorf("failed to init pinger, %v", err)
@@ -441,15 +555,14 @@ func (c *Controller) checkGatewayReady() error {
 					}
 					pinger.Run()
 
-					exist, err := c.checkNodeEcmpRouteExist(ip, subnet.Spec.CIDRBlock)
-					if err != nil {
-						klog.Errorf("get ecmp static route for subnet %v, error %v", subnet.Name, err)
-						break
+					if !nodeReady(node) {
+						success = false
 					}
+
 					if !success {
-						klog.Warningf("failed to ping gw %s", ip)
+						klog.Warningf("failed to ping ovn0 %s or node %v is not ready", ip, node.Name)
 						if exist {
-							if err := c.deleteStaticRoute(ip, c.config.ClusterRouter, subnet); err != nil {
+							if err := c.ovnClient.DeleteMatchedStaticRoute(cidrBlock, ip, c.config.ClusterRouter); err != nil {
 								klog.Errorf("failed to delete static route %s for node %s, %v", ip, node.Name, err)
 								return err
 							}
@@ -461,6 +574,14 @@ func (c *Controller) checkGatewayReady() error {
 								klog.Errorf("failed to add static route for node %s, %v", node.Name, err)
 								return err
 							}
+						}
+					}
+				} else {
+					if exist {
+						klog.Infof("subnet %v gatewayNode does not contains node %v, should delete ecmp route for node ip %s", subnet.Name, node.Name, ip)
+						if err := c.ovnClient.DeleteMatchedStaticRoute(cidrBlock, ip, c.config.ClusterRouter); err != nil {
+							klog.Errorf("failed to delete static route %s for node %s, %v", ip, node.Name, err)
+							return err
 						}
 					}
 				}
@@ -496,16 +617,36 @@ func (c *Controller) checkChassisDupl(node *v1.Node) error {
 		klog.Errorf("failed to get node %s chassisID, %v", node.Name, err)
 		return err
 	}
-
 	chassisAnn := node.Annotations[util.ChassisAnnotation]
-	if chassisAnn != "" && chassisAnn != chassisAdd {
-		klog.Errorf("duplicate chassis for node %s and new chassis %s", node.Name, chassisAdd)
-		if err := c.ovnClient.DeleteChassis(node.Name); err != nil {
-			klog.Errorf("failed to delete chassis for node %s %v", node.Name, err)
-			return err
-		}
+	if chassisAnn == chassisAdd || chassisAnn == "" {
+		return nil
 	}
 
-	klog.V(3).Infof("finish check chassis, add %s and ann %s", chassisAdd, chassisAnn)
+	klog.Errorf("duplicate chassis for node %s and new chassis %s", node.Name, chassisAdd)
+	if err := c.ovnClient.DeleteChassis(node.Name); err != nil {
+		klog.Errorf("failed to delete chassis for node %s %v", node.Name, err)
+		return err
+	}
+	return errors.New("deleting dismatch chassis id")
+}
+
+func (c *Controller) retryDelDupChassis(attempts int, sleep int, f func(node *v1.Node) error, node *v1.Node) (err error) {
+	i := 0
+	for ; ; i++ {
+		err = f(node)
+		if err == nil {
+			return
+		}
+		if i >= (attempts - 1) {
+			break
+		}
+		time.Sleep(time.Duration(sleep) * time.Second)
+	}
+	if i >= (attempts - 1) {
+		errMsg := fmt.Errorf("exhausting all attempts")
+		klog.Error(errMsg)
+		return errMsg
+	}
+	klog.V(3).Infof("finish check chassis")
 	return nil
 }

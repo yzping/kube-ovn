@@ -88,6 +88,11 @@ func ovsClear(table, record string, columns ...string) error {
 	return err
 }
 
+// Bridges returns bridges created by Kube-OVN
+func Bridges() ([]string, error) {
+	return ovsFind("bridge", "name", fmt.Sprintf("external-ids:vendor=%s", util.CniTypeName))
+}
+
 // ClearPodBandwidth remove qos related to this pod. Only used when remove pod.
 func ClearPodBandwidth(podName, podNamespace string) error {
 	qosList, err := ovsFind("qos", "_uuid", fmt.Sprintf(`external-ids:iface-id="%s.%s"`, podName, podNamespace))
@@ -108,7 +113,8 @@ func ClearPodBandwidth(podName, podNamespace string) error {
 	return nil
 }
 
-// SetInterfaceBandwidth set ingress/egress qos for given pod
+// SetInterfaceBandwidth set ingress/egress qos for given pod, annotation values are for node/pod
+// but ingress/egress parameters here are from the point of ovs port/interface view, so reverse input parameters when call func SetInterfaceBandwidth
 func SetInterfaceBandwidth(podName, podNamespace, iface, ingress, egress string) error {
 	ingressMPS, _ := strconv.Atoi(ingress)
 	ingressKPS := ingressMPS * 1000
@@ -119,7 +125,7 @@ func SetInterfaceBandwidth(podName, podNamespace, iface, ingress, egress string)
 
 	for _, ifName := range interfaceList {
 		// ingress_policing_rate is in Kbps
-		err := ovsSet("interface", ifName, fmt.Sprintf("ingress_policing_rate=%d", ingressKPS), fmt.Sprintf("ingress_policing_burst=%d", ingressKPS*10/8))
+		err := ovsSet("interface", ifName, fmt.Sprintf("ingress_policing_rate=%d", ingressKPS), fmt.Sprintf("ingress_policing_burst=%d", ingressKPS*8/10))
 		if err != nil {
 			return err
 		}
@@ -224,4 +230,33 @@ func CleanDuplicatePort(ifaceID string) {
 
 func SetPortTag(port, tag string) error {
 	return ovsSet("port", port, fmt.Sprintf("tag=%s", tag))
+}
+
+// ValidatePortVendor returns true if the port's external_ids:vendor=kube-ovn
+func ValidatePortVendor(port string) (bool, error) {
+	output, err := ovsFind("Port", "name", "external_ids:vendor="+util.CniTypeName)
+	return util.ContainsString(output, port), err
+}
+
+func GetResidualInternalPorts() []string {
+	residualPorts := make([]string, 0)
+	interfaceList, err := ovsFind("interface", "name,external_ids", "type=internal")
+	if err != nil {
+		klog.Errorf("failed to list ovs internal interface %v", err)
+		return residualPorts
+	}
+
+	for _, intf := range interfaceList {
+		name := strings.Trim(strings.Split(intf, "\n")[0], "\"")
+		if !strings.Contains(name, "_c") {
+			continue
+		}
+
+		// iface-id field does not exist in external_ids for residual internal port
+		externaIds := strings.Split(intf, "\n")[1]
+		if !strings.Contains(externaIds, "iface-id") {
+			residualPorts = append(residualPorts, name)
+		}
+	}
+	return residualPorts
 }

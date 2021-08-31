@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 
@@ -17,10 +18,9 @@ import (
 	"github.com/kubeovn/kube-ovn/test/e2e/framework"
 )
 
-const (
-	vlanBr  = util.UnderlayBridge
-	vlanNic = "eth0"
-)
+const vlanNic = "eth0"
+
+var vlanBr = util.ExternalBridgeName("provider")
 
 type nodeNetwork struct {
 	Gateway             string
@@ -36,19 +36,21 @@ var _ = Describe("[Vlan Node]", func() {
 	f := framework.NewFramework("node", fmt.Sprintf("%s/.kube/config", os.Getenv("HOME")))
 
 	var network *nodeNetwork
-	if len(networkJSON) != 0 {
-		network = new(nodeNetwork)
-		Expect(json.Unmarshal(networkJSON, network)).NotTo(HaveOccurred())
-	}
+	BeforeEach(func() {
+		if len(networkJSON) != 0 {
+			network = new(nodeNetwork)
+			Expect(json.Unmarshal(networkJSON, network)).NotTo(HaveOccurred())
+		}
+	})
 
 	It("Single NIC", func() {
 		nodes, err := f.KubeClientSet.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(nodes).NotTo(BeNil())
-		Expect(nodes.Items).NotTo(BeEmpty())
+		Expect(len(nodes.Items)).NotTo(BeZero())
 
-		nodeIPs := make([]string, 0, 2)
-		nodeRoutes := make([]string, 0, 2)
+		nodeIPs := make([]string, 0, len(nodes.Items))
+		nodeRoutes := make([]string, 0, len(nodes.Items))
 		if network != nil {
 			if network.IPAddress != "" {
 				nodeIPs = append(nodeIPs, fmt.Sprintf("%s/%d", network.IPAddress, network.IPPrefixLen))
@@ -146,23 +148,20 @@ var _ = Describe("[Vlan Node]", func() {
 		stdout, _, err = f.ExecToPodThroughAPI("ip addr show "+vlanNic, "openvswitch", ovsPod.Name, ovsPod.Namespace, nil)
 		Expect(err).NotTo(HaveOccurred())
 
-		var newMac, hasAddr bool
-		for i, s := range strings.Split(stdout, "\n") {
-			if i == 1 {
-				s = strings.TrimSpace(s)
-				newMac = strings.HasPrefix(s, "link/ether 00:00:00:")
-				if newMac && network != nil && network.MacAddress != "" {
-					newMac = !strings.HasPrefix(s, fmt.Sprintf("link/ether %s ", network.MacAddress))
-				}
-				continue
-			}
-
+		var hasAddr bool
+		for _, s := range strings.Split(stdout, "\n") {
 			if s = strings.TrimSpace(s); strings.HasPrefix(s, "inet ") || strings.HasPrefix(s, "inet6 ") {
+				if strings.HasPrefix(s, "inet6 ") {
+					_, ipnet, err := net.ParseCIDR(strings.Fields(s)[1])
+					Expect(err).NotTo(HaveOccurred())
+					if ipnet.String() == "fe80::/64" {
+						continue
+					}
+				}
 				hasAddr = true
 				break
 			}
 		}
-		Expect(newMac).To(BeTrue())
 		Expect(hasAddr).To(BeFalse())
 
 		stdout, _, err = f.ExecToPodThroughAPI("ip route show dev "+vlanBr, "openvswitch", ovsPod.Name, ovsPod.Namespace, nil)
@@ -192,6 +191,16 @@ var _ = Describe("[Vlan Node]", func() {
 
 		stdout, _, err = f.ExecToPodThroughAPI("ip -6 route show dev "+vlanNic, "openvswitch", ovsPod.Name, ovsPod.Namespace, nil)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(strings.TrimSpace(stdout)).To(BeEmpty())
+
+		var hasRoute bool
+		for _, s := range strings.Split(stdout, "\n") {
+			if s == "" || strings.HasPrefix(s, "fe80::/64 ") {
+				continue
+			}
+
+			hasRoute = true
+			break
+		}
+		Expect(hasRoute).To(BeFalse())
 	})
 })

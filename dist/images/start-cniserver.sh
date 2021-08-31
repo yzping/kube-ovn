@@ -28,11 +28,10 @@ do
   fi
 done
 
+# If nftables not exist do not exit
+set +e
 iptables -P FORWARD ACCEPT
 iptables-nft -P FORWARD ACCEPT
-
-# wait kube-ovn-controller ready
-kubectl rollout status deployment/kube-ovn-controller -n "$(cat /run/secrets/kubernetes.io/serviceaccount/namespace)"
-sleep 1
+set -e
 
 ./kube-ovn-daemon --ovs-socket=${OVS_SOCK} --bind-socket=${CNI_SOCK} "$@"

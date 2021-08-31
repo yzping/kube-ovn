@@ -2,12 +2,14 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -19,6 +21,7 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
@@ -40,6 +43,11 @@ import (
 // Controller watch pod and namespace changes to update iptables, ipset and ovs qos
 type Controller struct {
 	config *Configuration
+
+	providerNetworksLister          kubeovnlister.ProviderNetworkLister
+	providerNetworksSynced          cache.InformerSynced
+	addOrUpdateProviderNetworkQueue workqueue.RateLimitingInterface
+	deleteProviderNetworkQueue      workqueue.RateLimitingInterface
 
 	subnetsLister kubeovnlister.SubnetLister
 	subnetsSynced cache.InformerSynced
@@ -68,12 +76,19 @@ func NewController(config *Configuration, podInformerFactory informers.SharedInf
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: config.KubeClient.CoreV1().Events("")})
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: config.NodeName})
 
+	providerNetworkInformer := kubeovnInformerFactory.Kubeovn().V1().ProviderNetworks()
 	subnetInformer := kubeovnInformerFactory.Kubeovn().V1().Subnets()
 	podInformer := podInformerFactory.Core().V1().Pods()
 	nodeInformer := nodeInformerFactory.Core().V1().Nodes()
 
 	controller := &Controller{
-		config:        config,
+		config: config,
+
+		providerNetworksLister:          providerNetworkInformer.Lister(),
+		providerNetworksSynced:          providerNetworkInformer.Informer().HasSynced,
+		addOrUpdateProviderNetworkQueue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "AddOrUpdateProviderNetwork"),
+		deleteProviderNetworkQueue:      workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "DeleteProviderNetwork"),
+
 		subnetsLister: subnetInformer.Lister(),
 		subnetsSynced: subnetInformer.Informer().HasSynced,
 		subnetQueue:   workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Subnet"),
@@ -115,6 +130,11 @@ func NewController(config *Configuration, podInformerFactory informers.SharedInf
 		controller.ipset[kubeovnv1.ProtocolIPv6] = ipsets.NewIPSets(ipsets.NewIPVersionConfig(ipsets.IPFamilyV6, IPSetPrefix, nil, nil))
 	}
 
+	providerNetworkInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    controller.enqueueAddProviderNetwork,
+		UpdateFunc: controller.enqueueUpdateProviderNetwork,
+		DeleteFunc: controller.enqueueDeleteProviderNetwork,
+	})
 	subnetInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    controller.enqueueAddSubnet,
 		UpdateFunc: controller.enqueueUpdateSubnet,
@@ -125,6 +145,374 @@ func NewController(config *Configuration, podInformerFactory informers.SharedInf
 	})
 
 	return controller, nil
+}
+
+func (c *Controller) enqueueAddProviderNetwork(obj interface{}) {
+	key, err := cache.MetaNamespaceKeyFunc(obj)
+	if err != nil {
+		utilruntime.HandleError(err)
+		return
+	}
+
+	klog.V(3).Infof("enqueue add provider network %s", key)
+	c.addOrUpdateProviderNetworkQueue.Add(key)
+}
+
+func (c *Controller) enqueueUpdateProviderNetwork(old, new interface{}) {
+	key, err := cache.MetaNamespaceKeyFunc(new)
+	if err != nil {
+		utilruntime.HandleError(err)
+		return
+	}
+
+	klog.V(3).Infof("enqueue update provider network %s", key)
+	c.addOrUpdateProviderNetworkQueue.Add(key)
+}
+
+func (c *Controller) enqueueDeleteProviderNetwork(obj interface{}) {
+	klog.V(3).Infof("enqueue delete provider network %s", obj.(*kubeovnv1.ProviderNetwork).Name)
+	c.deleteProviderNetworkQueue.Add(obj)
+}
+
+func (c *Controller) runAddOrUpdateProviderNetworkWorker() {
+	for c.processNextAddOrUpdateProviderNetworkWorkItem() {
+	}
+}
+
+func (c *Controller) runDeleteProviderNetworkWorker() {
+	for c.processNextDeleteProviderNetworkWorkItem() {
+	}
+}
+
+func (c *Controller) processNextAddOrUpdateProviderNetworkWorkItem() bool {
+	obj, shutdown := c.addOrUpdateProviderNetworkQueue.Get()
+	if shutdown {
+		return false
+	}
+
+	err := func(obj interface{}) error {
+		defer c.addOrUpdateProviderNetworkQueue.Done(obj)
+		var key string
+		var ok bool
+		if key, ok = obj.(string); !ok {
+			c.addOrUpdateProviderNetworkQueue.Forget(obj)
+			utilruntime.HandleError(fmt.Errorf("expected string in workqueue but got %#v", obj))
+			return nil
+		}
+		if err := c.handleAddOrUpdateProviderNetwork(key); err != nil {
+			return fmt.Errorf("error syncing '%s': %s, requeuing", key, err.Error())
+		}
+		c.addOrUpdateProviderNetworkQueue.Forget(obj)
+		return nil
+	}(obj)
+
+	if err != nil {
+		utilruntime.HandleError(err)
+		c.addOrUpdateProviderNetworkQueue.AddRateLimited(obj)
+		return true
+	}
+	return true
+}
+
+func (c *Controller) processNextDeleteProviderNetworkWorkItem() bool {
+	obj, shutdown := c.deleteProviderNetworkQueue.Get()
+	if shutdown {
+		return false
+	}
+
+	err := func(obj interface{}) error {
+		defer c.deleteProviderNetworkQueue.Done(obj)
+		var pn *kubeovnv1.ProviderNetwork
+		var ok bool
+		if pn, ok = obj.(*kubeovnv1.ProviderNetwork); !ok {
+			c.deleteProviderNetworkQueue.Forget(obj)
+			utilruntime.HandleError(fmt.Errorf("expected ProviderNetwork in workqueue but got %#v", obj))
+			return nil
+		}
+		if err := c.handleDeleteProviderNetwork(pn); err != nil {
+			return fmt.Errorf("error syncing '%s': %v, requeuing", pn.Name, err)
+		}
+		c.deleteProviderNetworkQueue.Forget(obj)
+		return nil
+	}(obj)
+
+	if err != nil {
+		utilruntime.HandleError(err)
+		c.deleteProviderNetworkQueue.AddRateLimited(obj)
+		return true
+	}
+	return true
+}
+
+func (c *Controller) handleAddOrUpdateProviderNetwork(key string) error {
+	node, err := c.nodesLister.Get(c.config.NodeName)
+	if err != nil {
+		return err
+	}
+	pn, err := c.providerNetworksLister.Get(key)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	if util.ContainsString(pn.Spec.ExcludeNodes, node.Name) {
+		return c.cleanProviderNetwork(pn, node)
+	}
+	return c.initProviderNetwork(pn, node)
+}
+
+func (c *Controller) initProviderNetwork(pn *kubeovnv1.ProviderNetwork, node *v1.Node) error {
+	if pn.Status.EnsureNodeStandardConditions(node.Name) {
+		bytes, err := pn.Status.Bytes()
+		if err != nil {
+			klog.Error(err)
+			return err
+		}
+		pn, err = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
+		if err != nil {
+			klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
+			return err
+		}
+	}
+
+	nic := pn.Spec.DefaultInterface
+	for _, item := range pn.Spec.CustomInterfaces {
+		if util.ContainsString(item.Nodes, node.Name) {
+			nic = item.Interface
+			break
+		}
+	}
+
+	var mtu int
+	var err error
+	if mtu, err = ovsInitProviderNetwork(pn.Name, nic); err != nil {
+		if oldLen := len(node.Labels); oldLen != 0 {
+			delete(node.Labels, fmt.Sprintf(util.ProviderNetworkReadyTemplate, pn.Name))
+			delete(node.Labels, fmt.Sprintf(util.ProviderNetworkInterfaceTemplate, pn.Name))
+			delete(node.Labels, fmt.Sprintf(util.ProviderNetworkMtuTemplate, pn.Name))
+			if len(node.Labels) != oldLen {
+				raw, _ := json.Marshal(node.Labels)
+				patchPayload := fmt.Sprintf(`[{ "op": "replace", "path": "/metadata/labels", "value": %s }]`, raw)
+				_, err1 := c.config.KubeClient.CoreV1().Nodes().Patch(context.Background(), node.Name, types.JSONPatchType, []byte(patchPayload), metav1.PatchOptions{})
+				if err1 != nil {
+					klog.Errorf("failed to patch node %s: %v", node.Name, err1)
+				}
+			}
+		}
+
+		if util.ContainsString(pn.Status.ReadyNodes, node.Name) {
+			pn.Status.ReadyNodes = util.RemoveString(pn.Status.ReadyNodes, node.Name)
+			if len(pn.Status.ReadyNodes) == 0 {
+				bytes := []byte(`[{ "op": "remove", "path": "/status/readyNodes"}]`)
+				_, err1 := c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.JSONPatchType, bytes, metav1.PatchOptions{})
+				if err1 != nil {
+					klog.Errorf("failed to patch provider network %s: %v", pn.Name, err1)
+				}
+			} else {
+				bytes, err1 := pn.Status.Bytes()
+				if err1 != nil {
+					klog.Error(err1)
+				}
+				_, err1 = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
+				if err1 != nil {
+					klog.Errorf("failed to patch provider network %s: %v", pn.Name, err1)
+				}
+			}
+		}
+
+		pn.Status.SetNodeNotReady(node.Name, "InitOVSBridgeFailed", err.Error())
+		bytes, err1 := pn.Status.Bytes()
+		if err1 != nil {
+			klog.Error(err1)
+		} else {
+			_, err1 = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
+			if err1 != nil {
+				klog.Errorf("failed to patch provider network %s: %v", pn.Name, err1)
+			}
+		}
+
+		return err
+	}
+
+	pn.Status.SetNodeReady(node.Name, "InitOVSBridgeSucceeded", "")
+	bytes, err := pn.Status.Bytes()
+	if err != nil {
+		klog.Error(err)
+		return err
+	}
+	_, err = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
+	if err != nil {
+		klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
+		return err
+	}
+
+	delete(node.Labels, fmt.Sprintf(util.ProviderNetworkExcludeTemplate, pn.Name))
+	node.Labels[fmt.Sprintf(util.ProviderNetworkReadyTemplate, pn.Name)] = "true"
+	node.Labels[fmt.Sprintf(util.ProviderNetworkInterfaceTemplate, pn.Name)] = nic
+	node.Labels[fmt.Sprintf(util.ProviderNetworkMtuTemplate, pn.Name)] = strconv.Itoa(mtu)
+
+	patchPayloadTemplate := `[{ "op": "%s", "path": "/metadata/labels", "value": %s }]`
+	op := "replace"
+	if len(node.Labels) == 0 {
+		op = "add"
+	}
+
+	raw, _ := json.Marshal(node.Labels)
+	patchPayload := fmt.Sprintf(patchPayloadTemplate, op, raw)
+	_, err = c.config.KubeClient.CoreV1().Nodes().Patch(context.Background(), node.Name, types.JSONPatchType, []byte(patchPayload), metav1.PatchOptions{})
+	if err != nil {
+		klog.Errorf("failed to patch node %s: %v", node.Name, err)
+		return err
+	}
+
+	if !util.ContainsString(pn.Status.ReadyNodes, node.Name) {
+		pn.Status.ReadyNodes = append(pn.Status.ReadyNodes, node.Name)
+		bytes, err := pn.Status.Bytes()
+		if err != nil {
+			klog.Error(err)
+			return err
+		}
+
+		_, err = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
+		if err != nil {
+			klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (c *Controller) updateProviderNetworkStatusForNodeDeletion(pn *kubeovnv1.ProviderNetwork, node string) error {
+	if util.ContainsString(pn.Status.ReadyNodes, node) {
+		pn.Status.ReadyNodes = util.RemoveString(pn.Status.ReadyNodes, node)
+		if len(pn.Status.ReadyNodes) == 0 {
+			bytes := []byte(`[{ "op": "remove", "path": "/status/readyNodes"}]`)
+			_, err := c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.JSONPatchType, bytes, metav1.PatchOptions{})
+			if err != nil {
+				klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
+				return err
+			}
+		} else {
+			bytes, err := pn.Status.Bytes()
+			if err != nil {
+				klog.Error(err)
+				return err
+			}
+			_, err = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
+			if err != nil {
+				klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
+				return err
+			}
+		}
+	}
+	if pn.Status.RemoveNodeConditions(node) {
+		if len(pn.Status.Conditions) == 0 {
+			bytes := []byte(`[{ "op": "remove", "path": "/status/conditions"}]`)
+			_, err := c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.JSONPatchType, bytes, metav1.PatchOptions{})
+			if err != nil {
+				klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
+				return err
+			}
+		} else {
+			bytes, err := pn.Status.Bytes()
+			if err != nil {
+				klog.Error(err)
+				return err
+			}
+			_, err = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
+			if err != nil {
+				klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (c *Controller) cleanProviderNetwork(pn *kubeovnv1.ProviderNetwork, node *v1.Node) error {
+	patchPayloadTemplate := `[{ "op": "%s", "path": "/metadata/labels", "value": %s }]`
+	op := "replace"
+	if len(node.Labels) == 0 {
+		op = "add"
+	}
+
+	var err error
+	if pn.Status.RemoveNodeConditions(node.Name) {
+		if len(pn.Status.Conditions) == 0 {
+			bytes := []byte(`[{ "op": "remove", "path": "/status/conditions"}]`)
+			pn, err = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.JSONPatchType, bytes, metav1.PatchOptions{})
+			if err != nil {
+				klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
+				return err
+			}
+		} else {
+			bytes, err := pn.Status.Bytes()
+			if err != nil {
+				klog.Error(err)
+				return err
+			}
+			pn, err = c.config.KubeOvnClient.KubeovnV1().ProviderNetworks().Patch(context.Background(), pn.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
+			if err != nil {
+				klog.Errorf("failed to patch provider network %s: %v", pn.Name, err)
+				return err
+			}
+		}
+	}
+
+	delete(node.Labels, fmt.Sprintf(util.ProviderNetworkReadyTemplate, pn.Name))
+	delete(node.Labels, fmt.Sprintf(util.ProviderNetworkInterfaceTemplate, pn.Name))
+	delete(node.Labels, fmt.Sprintf(util.ProviderNetworkMtuTemplate, pn.Name))
+	node.Labels[fmt.Sprintf(util.ProviderNetworkExcludeTemplate, pn.Name)] = "true"
+	raw, _ := json.Marshal(node.Labels)
+	patchPayload := fmt.Sprintf(patchPayloadTemplate, op, raw)
+	_, err = c.config.KubeClient.CoreV1().Nodes().Patch(context.Background(), node.Name, types.JSONPatchType, []byte(patchPayload), metav1.PatchOptions{})
+	if err != nil {
+		klog.Errorf("failed to patch node %s: %v", node.Name, err)
+		return err
+	}
+
+	if err = c.updateProviderNetworkStatusForNodeDeletion(pn, node.Name); err != nil {
+		return err
+	}
+	if err = ovsCleanProviderNetwork(pn.Name); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *Controller) handleDeleteProviderNetwork(pn *kubeovnv1.ProviderNetwork) error {
+	if err := ovsCleanProviderNetwork(pn.Name); err != nil {
+		return err
+	}
+
+	node, err := c.nodesLister.Get(c.config.NodeName)
+	if err != nil {
+		return err
+	}
+	if len(node.Labels) == 0 {
+		return nil
+	}
+
+	patchPayloadTemplate := `[{ "op": "replace", "path": "/metadata/labels", "value": %s }]`
+	delete(node.Labels, fmt.Sprintf(util.ProviderNetworkReadyTemplate, pn.Name))
+	delete(node.Labels, fmt.Sprintf(util.ProviderNetworkExcludeTemplate, pn.Name))
+	delete(node.Labels, fmt.Sprintf(util.ProviderNetworkInterfaceTemplate, pn.Name))
+	delete(node.Labels, fmt.Sprintf(util.ProviderNetworkMtuTemplate, pn.Name))
+
+	raw, _ := json.Marshal(node.Labels)
+	patchPayload := fmt.Sprintf(patchPayloadTemplate, raw)
+	_, err = c.config.KubeClient.CoreV1().Nodes().Patch(context.Background(), node.Name, types.JSONPatchType, []byte(patchPayload), metav1.PatchOptions{})
+	if err != nil {
+		klog.Errorf("patch node %s failed %v", node.Name, err)
+		return err
+	}
+
+	return nil
 }
 
 type subnetEvent struct {
@@ -242,7 +630,7 @@ func (c *Controller) reconcileRouters(event subnetEvent) error {
 
 	cidrs := make([]string, 0, len(subnets)*2)
 	for _, subnet := range subnets {
-		if !subnet.Status.IsReady() || subnet.Spec.UnderlayGateway {
+		if subnet.Spec.Vpc != util.DefaultVpc || !subnet.Status.IsReady() || subnet.Spec.UnderlayGateway {
 			continue
 		}
 
@@ -475,7 +863,9 @@ func (c *Controller) getPolicyRouting(subnet *kubeovnv1.Subnet) ([]netlink.Rule,
 	} else {
 		for i := range protocols {
 			rule.Family, _ = util.ProtocolToFamily(protocols[i])
-			_, rule.Src, _ = net.ParseCIDR(cidr[i])
+			if len(cidr) == len(protocols) {
+				_, rule.Src, _ = net.ParseCIDR(cidr[i])
+			}
 			rules = append(rules, *rule)
 		}
 	}
@@ -585,7 +975,7 @@ func (c *Controller) handlePod(key string) error {
 		provider := fmt.Sprintf("%s.%s.ovn", multiNet.Name, multiNet.Namespace)
 		if pod.Annotations[fmt.Sprintf(util.AllocatedAnnotationTemplate, provider)] == "true" {
 			ifaceID = ovs.PodNameToPortName(pod.Name, pod.Namespace, provider)
-			err = ovs.SetInterfaceBandwidth(pod.Name, pod.Namespace, ifaceID, pod.Annotations[fmt.Sprintf(util.IngressRateAnnotationTemplate, provider)], pod.Annotations[fmt.Sprintf(util.EgressRateAnnotationTemplate, provider)])
+			err = ovs.SetInterfaceBandwidth(pod.Name, pod.Namespace, ifaceID, pod.Annotations[fmt.Sprintf(util.EgressRateAnnotationTemplate, provider)], pod.Annotations[fmt.Sprintf(util.IngressRateAnnotationTemplate, provider)])
 			if err != nil {
 				return err
 			}
@@ -594,27 +984,110 @@ func (c *Controller) handlePod(key string) error {
 	return nil
 }
 
+func (c *Controller) loopEncapIpCheck() {
+	node, err := c.nodesLister.Get(c.config.NodeName)
+	if err != nil {
+		klog.Errorf("failed to get node %s %v", c.config.NodeName, err)
+		return
+	}
+
+	if nodeTunnelName := node.GetAnnotations()[util.TunnelInterfaceAnnotation]; nodeTunnelName != "" {
+		iface, err := findInterface(nodeTunnelName)
+		if err != nil {
+			klog.Errorf("failed to find iface %s, %v", nodeTunnelName, err)
+			return
+		}
+		if iface.Flags&net.FlagUp == 0 {
+			klog.Errorf("iface %v is down", nodeTunnelName)
+			return
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			klog.Errorf("failed to get iface addr. %v", err)
+			return
+		}
+		if len(addrs) == 0 {
+			klog.Errorf("iface %s has no ip address", nodeTunnelName)
+			return
+		}
+
+		// if assigned iface in node annotation is down or with no ip, the error msg should be printed periodically
+		if c.config.Iface == nodeTunnelName {
+			klog.V(3).Infof("node tunnel interface %s not changed", nodeTunnelName)
+			return
+		}
+		c.config.Iface = nodeTunnelName
+		klog.Infof("Update node tunnel interface %v", nodeTunnelName)
+
+		encapIP := strings.Split(addrs[0].String(), "/")[0]
+		if err = setEncapIP(encapIP); err != nil {
+			klog.Errorf("failed to set encap ip %s for iface %s", encapIP, c.config.Iface)
+			return
+		}
+	}
+}
+
+var lastNoPodOvsPort map[string]bool
+
+func (c *Controller) markAndCleanInternalPort() error {
+	klog.V(4).Infof("start to gc ovs internal ports")
+	residualPorts := ovs.GetResidualInternalPorts()
+	if len(residualPorts) == 0 {
+		return nil
+	}
+
+	noPodOvsPort := map[string]bool{}
+	for _, portName := range residualPorts {
+		if !lastNoPodOvsPort[portName] {
+			noPodOvsPort[portName] = true
+		} else {
+			klog.Infof("gc ovs internal port %s", portName)
+			// Remove ovs port
+			output, err := ovs.Exec(ovs.IfExists, "--with-iface", "del-port", "br-int", portName)
+			if err != nil {
+				return fmt.Errorf("failed to delete ovs port %v, %q", err, output)
+			}
+		}
+	}
+	lastNoPodOvsPort = noPodOvsPort
+
+	return nil
+}
+
 // Run starts controller
 func (c *Controller) Run(stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
+	defer c.addOrUpdateProviderNetworkQueue.ShutDown()
+	defer c.deleteProviderNetworkQueue.ShutDown()
 	defer c.subnetQueue.ShutDown()
 	defer c.podQueue.ShutDown()
 
 	go wait.Until(ovs.CleanLostInterface, time.Minute, stopCh)
 	go wait.Until(recompute, 10*time.Minute, stopCh)
 
-	if ok := cache.WaitForCacheSync(stopCh, c.subnetsSynced, c.podsSynced, c.nodesSynced); !ok {
+	if ok := cache.WaitForCacheSync(stopCh, c.providerNetworksSynced, c.subnetsSynced, c.podsSynced, c.nodesSynced); !ok {
 		klog.Fatalf("failed to wait for caches to sync")
+		return
+	}
+
+	if err := c.setIPSet(); err != nil {
+		klog.Errorf("failed to set ipsets: %v", err)
 		return
 	}
 
 	klog.Info("Started workers")
 	go wait.Until(c.loopOvn0Check, 5*time.Second, stopCh)
-	go wait.Until(c.disableTunnelOffload, 5*time.Second, stopCh)
-
+	go wait.Until(c.runAddOrUpdateProviderNetworkWorker, time.Second, stopCh)
+	go wait.Until(c.runDeleteProviderNetworkWorker, time.Second, stopCh)
 	go wait.Until(c.runSubnetWorker, time.Second, stopCh)
 	go wait.Until(c.runPodWorker, time.Second, stopCh)
 	go wait.Until(c.runGateway, 3*time.Second, stopCh)
+	go wait.Until(c.loopEncapIpCheck, 3*time.Second, stopCh)
+	go wait.Until(func() {
+		if err := c.markAndCleanInternalPort(); err != nil {
+			klog.Errorf("gc ovs port error: %v", err)
+		}
+	}, 5*time.Minute, stopCh)
 	<-stopCh
 	klog.Info("Shutting down workers")
 }

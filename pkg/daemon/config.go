@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,15 +11,17 @@ import (
 	"regexp"
 	"strings"
 
-	clientset "github.com/kubeovn/kube-ovn/pkg/client/clientset/versioned"
-	"github.com/kubeovn/kube-ovn/pkg/util"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 	"github.com/vishvananda/netlink"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog"
+
+	clientset "github.com/kubeovn/kube-ovn/pkg/client/clientset/versioned"
+	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
 // Configuration is the daemon conf
@@ -48,10 +51,10 @@ type Configuration struct {
 func ParseFlags() (*Configuration, error) {
 	var (
 		argIface                 = pflag.String("iface", "", "The iface used to inter-host pod communication can be a nic name or a group of regex separated by comma, default: the default route iface")
-		argMTU                   = pflag.Int("mtu", 0, "The MTU used by pod iface, default: iface MTU - 100")
+		argMTU                   = pflag.Int("mtu", 0, "The MTU used by pod iface in overlay networks, default: iface MTU - 100")
 		argEnableMirror          = pflag.Bool("enable-mirror", false, "Enable traffic mirror, default: false")
 		argMirrorNic             = pflag.String("mirror-iface", "mirror0", "The mirror nic name that will be created by kube-ovn, default: mirror0")
-		argBindSocket            = pflag.String("bind-socket", "/var/run/cniserver.sock", "The socket daemon bind to.")
+		argBindSocket            = pflag.String("bind-socket", "/run/openvswitch/kube-ovn-daemon.sock", "The socket daemon bind to.")
 		argOvsSocket             = pflag.String("ovs-socket", "", "The socket to local ovs-server")
 		argKubeConfigFile        = pflag.String("kubeconfig", "", "Path to kubeconfig file with authorization and master location information. If not set use the inCluster token.")
 		argServiceClusterIPRange = pflag.String("service-cluster-ip-range", "10.96.0.0/12", "The kubernetes service cluster ip range, default: 10.96.0.0/12")
@@ -108,11 +111,11 @@ func ParseFlags() (*Configuration, error) {
 		DefaultInterfaceName:  *argsDefaultInterfaceName,
 	}
 
-	if err := config.initNicConfig(); err != nil {
+	if err := config.initKubeClient(); err != nil {
 		return nil, err
 	}
 
-	if err := config.initKubeClient(); err != nil {
+	if err := config.initNicConfig(); err != nil {
 		return nil, err
 	}
 
@@ -126,6 +129,17 @@ func (config *Configuration) initNicConfig() error {
 		err     error
 		encapIP string
 	)
+
+	//Support to specify node network card separately
+	node, err := config.KubeClient.CoreV1().Nodes().Get(context.Background(), config.NodeName, metav1.GetOptions{})
+	if err != nil {
+		klog.Errorf("Failed to find node info, err: %v", err)
+		return err
+	}
+	if nodeTunnelName := node.GetAnnotations()[util.TunnelInterfaceAnnotation]; nodeTunnelName != "" {
+		config.Iface = nodeTunnelName
+		klog.Infof("Find node tunnel interface name: %v", nodeTunnelName)
+	}
 
 	if config.Iface == "" {
 		podIP, ok := os.LookupEnv("POD_IP")
